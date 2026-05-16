@@ -17,17 +17,14 @@ from __future__ import annotations
 import asyncio
 import uuid
 
+import aiosqlite
 import streamlit as st
 from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
-from common.db import db_path
-# TODO: import the graph builder + helpers from your exercise 4 solution.
-# Suggestion: rename `exercises/exercise_4_audit.py` functions you need
-# (build_graph, handle_interrupt logic) and import them here, OR copy the
-# graph wiring inline.
-# from exercises.exercise_4_audit import build_graph
+from common.db import checkpoint_db_path, db_conn
+from exercises.exercise_4_audit import build_graph
 
 
 load_dotenv()
@@ -52,10 +49,45 @@ st.title("HITL PR Review Agent")
 # ─── Sidebar — recent sessions ─────────────────────────────────────────────
 with st.sidebar:
     st.header("Recent sessions")
-    # TODO: call `audit.replay.list_threads`-style query against audit_events
-    # and render thread_id + pr_url + worst_risk + last_event as a small table.
-    # On row click, set st.session_state.thread_id and rerun.
-    st.caption("(TODO — populate from audit_events)")
+
+    async def _recent_sessions() -> list[dict]:
+        async with db_conn() as conn:
+            async with conn.execute(
+                """
+                SELECT thread_id,
+                       pr_url,
+                       MAX(timestamp) AS last_event,
+                       CASE
+                           WHEN MAX(CASE WHEN risk_level = 'high' THEN 3 WHEN risk_level = 'med' THEN 2 ELSE 1 END) = 3 THEN 'high'
+                           WHEN MAX(CASE WHEN risk_level = 'high' THEN 3 WHEN risk_level = 'med' THEN 2 ELSE 1 END) = 2 THEN 'med'
+                           ELSE 'low'
+                       END AS worst_risk
+                  FROM audit_events
+                 GROUP BY thread_id, pr_url
+                 ORDER BY MAX(timestamp) DESC
+                 LIMIT 10
+                """
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    sessions = asyncio.run(_recent_sessions())
+    if not sessions:
+        st.caption("No recent sessions yet.")
+    for row in sessions:
+        label = f"{row['worst_risk']} | {row['pr_url'].rsplit('/', 1)[-1]} | {row['last_event']}"
+        if st.button(label, key=f"session_{row['thread_id']}"):
+            state = asyncio.run(load_session_state(row["thread_id"]))
+            values = state.values if getattr(state, "values", None) else {}
+            st.session_state.thread_id = row["thread_id"]
+            st.session_state.pr_url = values.get("pr_url", row["pr_url"])
+            st.session_state.interrupt_payload = None
+            st.session_state.final = None
+            if getattr(state, "interrupts", None):
+                st.session_state.interrupt_payload = state.interrupts[0].value
+            elif values:
+                st.session_state.final = values
+            st.rerun()
 
 
 # ─── Top form — start a new review ─────────────────────────────────────────
@@ -83,16 +115,12 @@ def render_approval_card(payload: dict) -> dict | None:
 
     feedback = st.text_input("Feedback (optional)", key="approval_feedback")
     col1, col2, col3 = st.columns(3)
-    # TODO: hook up the three buttons. Each click should return one of:
-    #   {"choice": "approve", "feedback": feedback}
-    #   {"choice": "reject",  "feedback": feedback}
-    #   {"choice": "edit",    "feedback": feedback}
     if col1.button("Approve", type="primary"):
-        ...  # return {"choice": "approve", ...}
+        return {"choice": "approve", "feedback": feedback}
     if col2.button("Reject"):
-        ...
+        return {"choice": "reject", "feedback": feedback}
     if col3.button("Edit"):
-        ...
+        return {"choice": "edit", "feedback": feedback}
     return None
 
 
@@ -106,31 +134,41 @@ def render_escalation_card(payload: dict) -> dict | None:
     st.markdown(payload["summary"])
 
     with st.form("escalation"):
-        # TODO: render one text_input per question in payload["questions"]
-        #       collect answers into a dict {question: answer_str}
-        #       on submit, return the dict.
         answers: dict[str, str] = {}
-        st.form_submit_button("Submit answers")
+        for idx, question in enumerate(payload.get("questions", [])):
+            answers[question] = st.text_input(question, key=f"escalation_{idx}")
+        submitted = st.form_submit_button("Submit answers")
+        if submitted:
+            return answers
     return None
 
 
 # ─── Drive the graph ───────────────────────────────────────────────────────
 async def run_graph(pr_url: str, thread_id: str, resume_value=None):
     """Invoke the graph once. Returns the final result or {'__interrupt__': ...}."""
-    async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
+    async with aiosqlite.connect(checkpoint_db_path()) as conn:
+        await conn.execute("PRAGMA journal_mode=MEMORY")
+        await conn.execute("PRAGMA synchronous=NORMAL")
+        cp = AsyncSqliteSaver(conn)
         await cp.setup()
-        # TODO: build the graph with `cp` as the checkpointer (use the function
-        # you imported/copied at the top of this file).
-        # app = build_graph(cp)
+        app = build_graph(cp)
         cfg = {"configurable": {"thread_id": thread_id}}
 
-        # TODO:
-        # - If resume_value is None: result = await app.ainvoke(
-        #       {"pr_url": pr_url, "thread_id": thread_id}, cfg)
-        # - Else:                    result = await app.ainvoke(
-        #       Command(resume=resume_value), cfg)
-        # - Return result.
-        raise NotImplementedError("Wire up the graph invocation")
+        if resume_value is None:
+            return await app.ainvoke({"pr_url": pr_url, "thread_id": thread_id}, cfg)
+        return await app.ainvoke(Command(resume=resume_value), cfg)
+
+
+async def load_session_state(thread_id: str):
+    """Load the latest persisted state for an existing thread."""
+    async with aiosqlite.connect(checkpoint_db_path()) as conn:
+        await conn.execute("PRAGMA journal_mode=MEMORY")
+        await conn.execute("PRAGMA synchronous=NORMAL")
+        cp = AsyncSqliteSaver(conn)
+        await cp.setup()
+        app = build_graph(cp)
+        cfg = {"configurable": {"thread_id": thread_id}}
+        return await app.aget_state(cfg)
 
 
 # ─── Main flow ─────────────────────────────────────────────────────────────
